@@ -488,6 +488,19 @@ TASK_CONFIGS.update(
                 "regimes": ["OLMo-v1"],
             },
         },
+        "cute": {
+            "task_name": "cute",
+            "split": "test",
+            "primary_metric": "greedy_acc",
+            "compute_gold_bpb": True,
+        },
+        "execute": {
+            "task_name": "cute",
+            "dataset_path": "benjamin/execute",
+            "split": "test",
+            "primary_metric": "greedy_acc",
+            "compute_gold_bpb": True,
+        },
         "drop::llama3": {
             "task_name": "drop",
             "split": "validation",

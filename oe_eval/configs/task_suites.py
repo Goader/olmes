@@ -1000,6 +1000,8 @@ TASK_SUITE_CONFIGS["bolmo1b"] = {
         "medmcqa:rc::none",
         "medqa_en:rc::none",
         "sciriff_yesno:rc::olmes",
+        "cute",
+        "execute",
     },
     "primary_metric": "macro",
 }
@@ -1046,6 +1048,9 @@ TASK_SUITE_CONFIGS["bolmo7b"] = {
         "naturalqs::xlarge",
         "squad::xlarge",
         "coqa::xlarge",
+        # Character Understanding
+        "cute",
+        "execute",
     },
     "primary_metric": "macro",
 }
