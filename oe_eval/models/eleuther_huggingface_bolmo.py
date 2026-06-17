@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import transformers
 from lm_eval import utils
 from lm_eval.models.huggingface import HFLM
-from lm_eval.models.utils import Collator, pad_and_concat
+from lm_eval.models.utils import Collator, pad_and_concat, stop_sequences_criteria
 from tqdm import tqdm
 
 from oe_eval.components.instances import RequestInstance
@@ -148,6 +148,37 @@ class HFLM_Bolmo_Verbose(HFLM):
             start = span[1]
         output += text[start:]
         return output
+
+    def _model_generate(self, context, max_length, stop, **generation_kwargs):
+        # temperature = 0.0 if not set
+        # if do_sample is false and temp==0.0:
+        # remove temperature, as do_sample=False takes care of this
+        # and we don't want a warning from HF
+        generation_kwargs["temperature"] = generation_kwargs.get("temperature", 0.0)
+        do_sample = generation_kwargs.get("do_sample", None)
+
+        # The temperature has to be a strictly positive float -- if it is 0.0, use greedy decoding strategies
+        if generation_kwargs.get("temperature") == 0.0 and do_sample is None:
+            generation_kwargs["do_sample"] = do_sample = False
+
+        if do_sample is False and generation_kwargs.get("temperature") == 0.0:
+            generation_kwargs.pop("temperature")
+        stopping_criteria = stop_sequences_criteria(
+            self.tokenizer,
+            stop_sequences=stop,
+            # bolmo.generate applies stopping criteria only over the continuation
+            initial_decoder_input_length=0,
+            # bolmo.generate applies stopping criteria separately per example
+            batch_size=1,
+        )
+        return self.model.generate(
+            context,
+            max_length=max_length,
+            stopping_criteria=stopping_criteria,
+            pad_token_id=self.tokenizer.pad_token_id,
+            use_cache=True,
+            **generation_kwargs,
+        )
 
     def tok_encode(
         self,
@@ -694,27 +725,17 @@ class HFLM_Bolmo_Verbose(HFLM):
                 stop=until,
                 **kwargs,
             )
-            # Extract generated sequences and corresponding logits
-            cont_toks_list = output["sequences"].tolist()
-            gen_sequences = output["sequences"][:, context_enc.shape[1] :]
+            # Extract generated sequences
+            cont_toks_list = []
+            for out, context_enc in zip(output.tolist(), context_enc.tolist()):
+                out_nopad = [x for x in out if x != self.tokenizer.pad_token_id]
+                context_enc_nopad = [x for x in context_enc if x != self.tokenizer.pad_token_id]
+                cont_toks = out_nopad[len(context_enc_nopad) :]
+                cont_toks_list.append(cont_toks)
 
-            # stack scores generated at each step
-            scores = torch.stack(output["scores"], dim=1)  # shape [batch_size, seq_len, vocab_size]
-            log_probs = F.log_softmax(scores, dim=-1)
-
-            # collect scores/logits of the generated token
-            gen_scores_list = torch.gather(scores, 2, gen_sequences[:, :, None]).squeeze(
-                -1
-            )  # shape [batch_size, seq_len]
-            gen_log_probs_list = torch.gather(log_probs, 2, gen_sequences[:, :, None]).squeeze(-1)
-
-            for cont_toks, gen_scores, gen_log_probs, context in zip(
-                cont_toks_list, gen_scores_list, gen_log_probs_list, contexts
+            for cont_toks, context in zip(
+                cont_toks_list, contexts
             ):
-                # discard context + left-padding toks if using causal decoder-only LM
-                if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
-                    cont_toks = cont_toks[context_enc.shape[1] :]
-
                 s_raw = self.tok_decode(cont_toks)
                 s = cut_at_stop_sequence(s_raw, until)
                 no_pad_len = len(cont_toks)
@@ -728,12 +749,9 @@ class HFLM_Bolmo_Verbose(HFLM):
                         break
                 cont_toks_no_pad = cont_toks[:no_pad_len]
 
-                logits = gen_log_probs[: len(cont_toks_no_pad)]
-                sum_logits = logits.sum().item()
-
                 res1 = {
                     "continuation": s,
-                    "sum_logits": sum_logits,
+                    "sum_logits": 0,  # not supported
                     "num_tokens": len(cont_toks_no_pad),
                     # "tokens": cont_toks_no_pad,
                     # "logits": logits.tolist(),
