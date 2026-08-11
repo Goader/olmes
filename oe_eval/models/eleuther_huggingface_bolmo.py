@@ -2,6 +2,8 @@
 # Changes marked with NOTE(BOLMO).
 
 import copy
+import hashlib
+import json
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
@@ -36,6 +38,20 @@ class HFLM_Bolmo_Verbose(HFLM):
         device: Optional[str] = None,
         device_map_option: Optional[str] = "auto",
         dtype: Optional[Union[str, torch.dtype]] = None,
+        # Force patch boundaries instead of letting the model predict them.
+        #   None                  -> unchanged behaviour (model predicts its own)
+        #   "self"                -> the model's own predicted mask, fed back in (null control)
+        #   <hf tokenizer id>     -> that tokenizer's segmentation, e.g. "google/gemma-2-2b"
+        # Declared explicitly rather than read out of **kwargs, because anything left in
+        # kwargs is forwarded to HFLM.__init__, which rejects unknown arguments.
+        boundary_source: Optional[str] = None,
+        # Path to write the patch boundaries actually used, one JSON object per scored
+        # sequence. Requires `boundary_source`; pass "self" to capture what the model
+        # predicts for itself, which is bit-identical to leaving boundaries unforced.
+        boundary_dump: Optional[str] = None,
+        # Ablation: drop the expanded-embedding channel, which adds a learned
+        # dolma2-subword feature to every byte independently of where patches fall.
+        disable_expanded_embeddings: bool = False,
         **kwargs,
         # pretrained: Optional[Union[str, transformers.PreTrainedModel]] = "gpt2",
         # backend: Optional[Literal["default", "causal", "seq2seq"]] = "default",
@@ -90,8 +106,44 @@ class HFLM_Bolmo_Verbose(HFLM):
             pretrained, device=device, dtype=dtype, device_map_option=device_map_option, **kwargs
         )
         self.tokenizer_size = len(self.tokenizer)
-        self.vocab_size_bolmo = 4 + 256 # 4 special tokens + 256 byte tokens
+
+        # NOTE(BOLMO): byte ids are laid out as the BLT special tokens followed by the 256
+        # byte values, doubled for the fused patch-ending half (BolmoTokenizerConfig), so a
+        # raw byte b is encoded as b + n_special_ids within each half. Read off the
+        # tokenizer rather than restated here, since both bounds are checkpoint facts.
+        assert (
+            self.tokenizer.config.special_tokens_first
+        ), "byte-id layout assumes the special tokens come first"
+        self.n_special_ids = self.tokenizer.offset
+        self.vocab_size_bolmo = self.tokenizer.config.vocab_size // 2
+        assert self.vocab_size_bolmo == self.n_special_ids + 256
+
         self.newline_id = self.tok_encode("\n")[-1]
+
+        # NOTE(BOLMO): forced-boundary evaluation. Loaded once per run rather than per batch.
+        self.boundary_source = boundary_source
+        if boundary_source is not None and boundary_source != "self":
+            self.boundary_tokenizer = transformers.AutoTokenizer.from_pretrained(
+                boundary_source, use_fast=True
+            )
+        else:
+            self.boundary_tokenizer = None
+
+        self.boundary_dump = boundary_dump
+        if boundary_dump is not None:
+            if boundary_source is None:
+                raise ValueError(
+                    "boundary_dump requires boundary_source; use 'self' to capture the "
+                    "model's own boundaries without changing its behaviour"
+                )
+            # truncate any previous run so a re-run does not append to stale rows
+            open(boundary_dump, "w").close()
+
+        # NOTE(BOLMO): a plain attribute on the local encoder gates both the addition in
+        # _embed and the lazy derivation of expanded_input_ids, so flipping it is enough.
+        if disable_expanded_embeddings:
+            self.model.model.local_encoder.add_expanded_embeddings = False  # type: ignore
+            eval_logger.info("BOLMO: expanded-embedding channel disabled")
 
     def unload_model(self):
         # Unload model from GPU, following advice in https://stackoverflow.com/questions/69357881
@@ -148,6 +200,145 @@ class HFLM_Bolmo_Verbose(HFLM):
             start = span[1]
         output += text[start:]
         return output
+
+    # NOTE(BOLMO): the inherited HFLM._model_call forwards only attn_mask/labels, so a
+    # boundary mask cannot reach the model through it. Without a mask we delegate to the
+    # parent unchanged, which keeps runs without `boundary_source` identical to before.
+    def _model_call(self, inps, attn_mask=None, labels=None, boundary_mask=None):
+        if boundary_mask is None:
+            return super()._model_call(inps, attn_mask=attn_mask, labels=labels)
+
+        if attn_mask is not None or labels is not None:
+            raise NotImplementedError("boundary_mask is not supported for seq2seq models")
+
+        assert self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM
+        with torch.no_grad():
+            return self.model(inps, boundary_mask=boundary_mask).logits
+
+    def _row_bytes_and_positions(self, ids: List[int]) -> Tuple[bytes, List[int], List[int]]:
+        """Split one row of byte ids into its raw bytes, their row positions, and specials."""
+        data = bytearray()
+        byte_positions: List[int] = []
+        special_positions: List[int] = []
+        for position, token_id in enumerate(ids):
+            # the modulo folds the fused patch-ending half back onto the plain one
+            base = token_id % self.vocab_size_bolmo
+            if base >= self.n_special_ids:
+                data.append(base - self.n_special_ids)
+                byte_positions.append(position)
+            else:
+                special_positions.append(position)
+        return bytes(data), byte_positions, special_positions
+
+    @staticmethod
+    def boundary_dump_key(context: str, continuation: str) -> str:
+        """Stable join key between a dumped row and the request that produced it."""
+        digest = hashlib.sha1(f"{context}\x00{continuation}".encode("utf-8"))
+        return digest.hexdigest()
+
+    def _dump_boundaries(self, chunk, boundary_mask: torch.Tensor, inplens: List[int]) -> None:
+        """Append the boundaries actually used for each sequence in this batch.
+
+        Rows are emitted in the collator's sorted order, not request order, so each carries
+        a content hash rather than an index; join against the requests file offline.
+        Boundary positions are stored rather than a full bool vector, which is both smaller
+        and directly readable.
+        """
+        with open(cast(str, self.boundary_dump), "a") as handle:
+            for (request_str, _, _), row, inplen in zip(chunk, boundary_mask, inplens):
+                context, continuation = request_str
+                positions = torch.nonzero(row[: int(inplen)], as_tuple=False)
+                handle.write(
+                    json.dumps(
+                        {
+                            "key": self.boundary_dump_key(context, continuation),
+                            "n_bytes": int(inplen),
+                            "boundaries": positions.flatten().tolist(),
+                        }
+                    )
+                    + "\n"
+                )
+
+    def _predicted_boundary_mask(self, batched_inps: torch.Tensor) -> torch.Tensor:
+        """The mask the model would have predicted for itself, for the null control.
+
+        Deliberately not `prefill_boundary_prediction_forward`: that passes a
+        `boundary_state`, which makes the local encoder overwrite the final position
+        (`boundary_mask[:, -1] = boundary_state.mask`). The loglikelihood path calls the
+        model with no boundary_state, so reproducing it means leaving that out.
+        """
+        inner = self.model.model  # type: ignore
+        with torch.no_grad():
+            expanded_input_ids = None
+            if inner.local_encoder.add_expanded_embeddings:
+                # BolmoModel.forward derives these lazily when they are not supplied;
+                # expand_byte_ids emits one id per byte, so the rows stay rectangular
+                expanded_input_ids = torch.tensor(
+                    [inner.tokenizer.expand_byte_ids(row) for row in batched_inps.tolist()],
+                    dtype=torch.long,
+                    device=batched_inps.device,
+                )
+
+            _, _, _, boundary_mask = inner.local_encoder(
+                input_ids=batched_inps,
+                expanded_input_ids=expanded_input_ids,
+                true_boundary_mask=None,
+                boundary_state=None,
+                pad_state=None,
+            )
+
+        return cast(torch.Tensor, boundary_mask)
+
+    def _build_boundary_mask(
+        self, batched_inps: torch.Tensor, inplens: List[int]
+    ) -> torch.Tensor:
+        """Forced patch boundaries for an already-batched input; True ends a patch.
+
+        `batched_inps` is [batch, padding_len], right-padded, taken after `_unmask_tokens`.
+        With `boundary_source="self"` this returns the model's own predicted mask, so
+        feeding it back in must reproduce the unforced result exactly.
+        """
+        if self.boundary_source == "self":
+            return self._predicted_boundary_mask(batched_inps)
+
+        assert self.boundary_tokenizer is not None
+        batch_size, padding_len = batched_inps.shape
+        mask = torch.zeros(
+            batch_size, padding_len, dtype=torch.bool, device=batched_inps.device
+        )
+
+        for row, (ids, inplen) in enumerate(zip(batched_inps.tolist(), inplens)):
+            data, byte_positions, special_positions = self._row_bytes_and_positions(
+                ids[: int(inplen)]
+            )
+
+            # BOS is always a boundary (the model forces position 0 regardless), and any
+            # other special token stands as its own patch
+            mask[row, 0] = True
+            for position in special_positions:
+                mask[row, position] = True
+
+            if not data:
+                continue
+
+            text = data.decode("utf-8", errors="replace")
+            offsets = self.boundary_tokenizer(
+                text, add_special_tokens=False, return_offsets_mapping=True
+            )["offset_mapping"]
+
+            # offset_mapping is in characters but the model indexes bytes, and the two
+            # disagree on any multi-byte character, so convert through a prefix table
+            char_to_byte = [0]
+            for character in text:
+                char_to_byte.append(char_to_byte[-1] + len(character.encode("utf-8")))
+
+            for _, char_end in offsets:
+                byte_end = char_to_byte[char_end]
+                # the mask marks the last byte OF a patch, not the gap after it
+                if 0 < byte_end <= len(byte_positions):
+                    mask[row, byte_positions[byte_end - 1]] = True
+
+        return mask
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
         # temperature = 0.0 if not set
@@ -480,6 +671,14 @@ class HFLM_Bolmo_Verbose(HFLM):
             # since masked tokens will have negative input ids
             # it does not change the behavior in the default case
             batched_inps, _ = self._unmask_tokens(batched_inps)
+
+            # NOTE(BOLMO): forced boundaries, built after `_unmask_tokens` so the ids are
+            # real bytes rather than the negative placeholders used for masked spans.
+            if self.boundary_source is not None:
+                boundary_mask = self._build_boundary_mask(batched_inps, inplens)
+                call_kwargs["boundary_mask"] = boundary_mask
+                if self.boundary_dump is not None:
+                    self._dump_boundaries(chunk, boundary_mask, inplens)
 
             # Show the first direct input into the model
             if not hasattr(self, "_shown_model_input"):

@@ -15,6 +15,12 @@ MODEL_DEFAULTS = {
     "use_fast_tokenizer": True,
     "add_bos_token": False,
     "prefix_token_id": None,
+    # NOTE(BOLMO): force patch boundaries instead of letting a byte-level model predict
+    # them. None keeps the model's own; "self" feeds its own prediction back in (null
+    # control); anything else names an HF tokenizer whose segmentation to impose.
+    "boundary_source": None,
+    "boundary_dump": None,
+    "disable_expanded_embeddings": False,
     "parallelize": False,
     "device_map_option": "auto",
     "peft": None,
