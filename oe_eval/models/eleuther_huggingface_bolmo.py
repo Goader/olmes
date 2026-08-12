@@ -15,6 +15,11 @@ from lm_eval.models.huggingface import HFLM
 from lm_eval.models.utils import Collator, pad_and_concat, stop_sequences_criteria
 from tqdm import tqdm
 
+# NOTE(BOLMO): this fork depends on the experiment package so the byte-offset ->
+# model-position conversion has exactly one implementation. Without it a forced eval mask
+# and an E4 training target can disagree on the convention, which they silently did.
+from omnistudent.segmentation import TokenizerBoundarySource, forced_boundary_mask
+
 from oe_eval.components.instances import RequestInstance
 from oe_eval.components.requests import (
     GenerateUntilAndLoglikelihoodRequest,
@@ -107,16 +112,12 @@ class HFLM_Bolmo_Verbose(HFLM):
         )
         self.tokenizer_size = len(self.tokenizer)
 
-        # NOTE(BOLMO): byte ids are laid out as the BLT special tokens followed by the 256
-        # byte values, doubled for the fused patch-ending half (BolmoTokenizerConfig), so a
-        # raw byte b is encoded as b + n_special_ids within each half. Read off the
-        # tokenizer rather than restated here, since both bounds are checkpoint facts.
-        assert (
-            self.tokenizer.config.special_tokens_first
-        ), "byte-id layout assumes the special tokens come first"
-        self.n_special_ids = self.tokenizer.offset
+        # NOTE(BOLMO): half the fused vocabulary — the plain byte half, before the
+        # patch-ending duplicate. Used below to fold the two halves together when scoring.
+        # The *id layout* (which ids are specials, where bytes start) is not restated here:
+        # `omnistudent.segmentation.forced_boundary_mask` reads it off the tokenizer.
         self.vocab_size_bolmo = self.tokenizer.config.vocab_size // 2
-        assert self.vocab_size_bolmo == self.n_special_ids + 256
+        assert self.vocab_size_bolmo == self.tokenizer.offset + 256
 
         self.newline_id = self.tok_encode("\n")[-1]
 
@@ -126,8 +127,12 @@ class HFLM_Bolmo_Verbose(HFLM):
             self.boundary_tokenizer = transformers.AutoTokenizer.from_pretrained(
                 boundary_source, use_fast=True
             )
+            # NOTE(BOLMO): omnistudent owns the byte-offset -> model-position conversion, so
+            # a forced eval mask and an E4 training target cannot disagree on the convention
+            self.boundary_segmenter = TokenizerBoundarySource(boundary_source, self.boundary_tokenizer)
         else:
             self.boundary_tokenizer = None
+            self.boundary_segmenter = None
 
         self.boundary_dump = boundary_dump
         if boundary_dump is not None:
@@ -215,21 +220,6 @@ class HFLM_Bolmo_Verbose(HFLM):
         with torch.no_grad():
             return self.model(inps, boundary_mask=boundary_mask).logits
 
-    def _row_bytes_and_positions(self, ids: List[int]) -> Tuple[bytes, List[int], List[int]]:
-        """Split one row of byte ids into its raw bytes, their row positions, and specials."""
-        data = bytearray()
-        byte_positions: List[int] = []
-        special_positions: List[int] = []
-        for position, token_id in enumerate(ids):
-            # the modulo folds the fused patch-ending half back onto the plain one
-            base = token_id % self.vocab_size_bolmo
-            if base >= self.n_special_ids:
-                data.append(base - self.n_special_ids)
-                byte_positions.append(position)
-            else:
-                special_positions.append(position)
-        return bytes(data), byte_positions, special_positions
-
     @staticmethod
     def boundary_dump_key(context: str, continuation: str) -> str:
         """Stable join key between a dumped row and the request that produced it."""
@@ -295,50 +285,23 @@ class HFLM_Bolmo_Verbose(HFLM):
         """Forced patch boundaries for an already-batched input; True ends a patch.
 
         `batched_inps` is [batch, padding_len], right-padded, taken after `_unmask_tokens`.
-        With `boundary_source="self"` this returns the model's own predicted mask, so
-        feeding it back in must reproduce the unforced result exactly.
+        With `boundary_source="self"` this returns the model's own predicted mask, so feeding
+        it back in must reproduce the unforced result exactly — that branch is genuinely
+        eval-specific and stays here. Everything else defers to
+        `omnistudent.segmentation.forced_boundary_mask`, which is the single definition of
+        how a byte-offset cut set becomes a model-indexed mask.
         """
         if self.boundary_source == "self":
             return self._predicted_boundary_mask(batched_inps)
 
-        assert self.boundary_tokenizer is not None
-        batch_size, padding_len = batched_inps.shape
-        mask = torch.zeros(
-            batch_size, padding_len, dtype=torch.bool, device=batched_inps.device
+        assert self.boundary_segmenter is not None
+        return forced_boundary_mask(
+            source=self.boundary_segmenter,
+            tokenizer=self.tokenizer,
+            input_ids=batched_inps,
+            lengths=inplens,
+            device=batched_inps.device,
         )
-
-        for row, (ids, inplen) in enumerate(zip(batched_inps.tolist(), inplens)):
-            data, byte_positions, special_positions = self._row_bytes_and_positions(
-                ids[: int(inplen)]
-            )
-
-            # BOS is always a boundary (the model forces position 0 regardless), and any
-            # other special token stands as its own patch
-            mask[row, 0] = True
-            for position in special_positions:
-                mask[row, position] = True
-
-            if not data:
-                continue
-
-            text = data.decode("utf-8", errors="replace")
-            offsets = self.boundary_tokenizer(
-                text, add_special_tokens=False, return_offsets_mapping=True
-            )["offset_mapping"]
-
-            # offset_mapping is in characters but the model indexes bytes, and the two
-            # disagree on any multi-byte character, so convert through a prefix table
-            char_to_byte = [0]
-            for character in text:
-                char_to_byte.append(char_to_byte[-1] + len(character.encode("utf-8")))
-
-            for _, char_end in offsets:
-                byte_end = char_to_byte[char_end]
-                # the mask marks the last byte OF a patch, not the gap after it
-                if 0 < byte_end <= len(byte_positions):
-                    mask[row, byte_positions[byte_end - 1]] = True
-
-        return mask
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
         # temperature = 0.0 if not set
